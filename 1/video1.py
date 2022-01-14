@@ -3,6 +3,9 @@ import json
 from PIL import Image
 
 
+blocksize = 8   # 切割图块的大小
+
+
 def grayimage(path):
     # convert('L') 转为灰度图
     # 这样每个像素点就只有一个灰度数据
@@ -29,8 +32,14 @@ def cut_image(image, width):
         for x in range(0, w, width):
             blocks[(x, y)] = get_block(pixels, x, y, width)
     
-    assert(len(blocks) == w // 8 * h // 8)
+    assert(len(blocks) == w // blocksize * h // blocksize)
     return blocks
+
+
+# 把图块 block 存储到 pixels[x, y] 处
+def save_image(pixels, x, y, block):
+    for i in range(len(block)):
+        pixels[x + i % blocksize, y + i // blocksize] = block[i]
 
 
 # 图块相似度比较算法
@@ -46,40 +55,33 @@ def SAD(block1, block2):
 
 
 # 在 image 中查找与 block 最相似的图块
-def find_similar_block(image, x, y, block):
+def find_similar_block(image, x, y, block, radius, threshold):
     w, h = image.size
-    width = 4   # 搜索范围
-    similarity = 1000000
-    sim_xm, sim_y = x, y
-    sim_block = None
-
-    # 获取方圆 width 个像素的方块
-    # 比较图块之间的相似度
-    for ny in range(y - width, y + width + 1):
-        for nx in range(x - width, x + width + 1):
-            if 0 <= nx < w - 8 and 0 <= ny < h - 8:
-                curr_block = get_block(image.load(), nx, ny, 8)
-                sim = SAD(block, curr_block)
-                if sim < similarity:
-                    similarity = sim
-                    sim_x, sim_y = nx, ny
-                    sim_block = curr_block
-    
-    assert(sim_block is not None)
-    
-    # 获取最相似的图块数据
+    # 存储最相似的图块数据
     blockInfo = {
-        'x': sim_x,
-        'y': sim_y,
+        'x': -1,
+        'y': -1,
     }
-    return blockInfo, sim_block
+
+    r = radius
+    # 获取方圆 radius 个像素的方块
+    # 比较图块之间的相似度
+    for ny in range(y - r, y + r + 1):
+        for nx in range(x - r, x + r + 1):
+            if 0 <= nx < w - blocksize and 0 <= ny < h - blocksize:
+                curr_block = get_block(image.load(), nx, ny, blocksize)
+                if SAD(block, curr_block) < threshold:
+                    blockInfo['x'] = nx
+                    blockInfo['y'] = ny
+    
+    return blockInfo
 
 
 # 对 img2 进行编码
 def encode(img1, img2):
 
     # 将 img2 划分为 8x8 大小的图块
-    blocks = cut_image(img2, 8)
+    blocks = cut_image(img2, blocksize)
 
     # blockInfos 用于存储图像 b 的图块信息
     # 数组中的每个元素是一个如下的字典, 表示一个图块的信息
@@ -88,21 +90,21 @@ def encode(img1, img2):
     #   'y': 图块在 a 中的坐标 y，如果为 -1 说明没找到合适的相似图块
     # }
     blockInfos = []
+    
     # 差值图
     diffImg = Image.new('L', img1.size)
     diffPixels = diffImg.load()
-
+    
     # 对于每一个图块, 在 img1 中查找最相似的图块的坐标
     for c, b in blocks.items():
         x, y = c
-        blockInfo, sim_block = find_similar_block(img1, x, y, b)
+        # 方圆搜索
+        blockInfo = find_similar_block(img1, x, y, b, radius=4, threshold=90)
         blockInfos.append(blockInfo)
 
-        # 计算差值图, diffImg = sim_block - block
-        for i in range(len(b)):
-            diff_x = x + i % 8
-            diff_y = y + i // 8
-            diffPixels[diff_x, diff_y] = sim_block[i] - b[i]
+        # 如果没有找到相似的图块, 则直接把 b 这个图块存下来
+        if blockInfo['x'] == -1:
+            save_image(diffPixels, x, y, b)
 
     with open('big_buck_bunny_08361.videoblock', 'w+') as f:
         f.write(json.dumps(blockInfos, indent=2))
@@ -116,22 +118,23 @@ def decode(img, diffImg, blockInfos):
     decodePixels = decodeImg.load()
 
     # 将 diffImg 切成 8x8 大小的图块
-    blocks = cut_image(diffImg, 8)
+    diff_blocks = cut_image(diffImg, blocksize)
     index = 0
-    for c, b in blocks.items():
+    for c, diff_b in diff_blocks.items():
         x, y = c
         # 对于 diffImg 中的每一图块，利用图块的信息找到 img 中对应的图块
         blockInfo = blockInfos[index]
         index += 1
-        sim_block = get_block(img.load(), blockInfo['x'], blockInfo['y'], 8)
 
-        # 图像还原, block = sim_block - diffImg
-        for i in range(len(b)):
-            decode_x = x + i % 8
-            decode_y = y + i // 8
-            decodePixels[decode_x, decode_y] = sim_block[i] - b[i]
+        if blockInfo['x'] == -1:
+            # 没有对应的图块, 说明 diffImg 中直接存储了原图的数据
+            # 直接把数据拷贝过来即可
+            save_image(decodePixels, x, y, diff_b)
+        else:
+            # 有对应的图块, 则切出对应位置的方块, 并将数据拷贝过来
+            sim_block = get_block(img.load(), blockInfo['x'], blockInfo['y'], blocksize)
+            save_image(decodePixels, x, y, sim_block)
     
-    # 存储还原后的图片
     decodeImg.save('big_buck_bunny_08361.decode.jpg')
 
 
@@ -144,7 +147,7 @@ def main():
         img1 = grayimage(path1)
         img2 = grayimage(path2)
         encode(img1, img2)
-    else:
+    elif mode == 'decode':
         print('decode')
         path1 = 'big_buck_bunny_08360.png'
         path2 = 'big_buck_bunny_08361.diff.jpg'
@@ -154,6 +157,8 @@ def main():
         with open(path3, 'r') as f:
             blockInfos = json.load(f)
         decode(img, diffImg, blockInfos)
+    else:
+        exit(1)
 
 
 if __name__ == '__main__':
