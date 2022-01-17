@@ -1,3 +1,5 @@
+# python3 video2.py
+
 import os
 import sys
 import json
@@ -8,67 +10,47 @@ from PIL import Image
 blocksize = 8   # 切割图块的大小
 
 
-def db_create(directory):
+# 从 tmp/ 目录下读取 videoblock 和 diff.jpg
+# 并将二进制格式存入数据库
+def video_db(dir):
     # 连接数据库
     # 如果数据库文件不存在，则会创建数据库文件
     conn = sqlite3.connect('video.db')
     cursor = conn.cursor()
 
     # 创建一个 frames 表
-    # 每个数据有 3 个字段
+    # 每个数据有 4 个字段
     #   id: number
     #   name: string
-    #   image: 文件的二进制数据
-    sql = 'create table if not exists frames(id integer, name text, image blob)'
+    #   videoblock: 文件的二进制数据
+    #   diff: 文件的二进制数据
+    sql = 'create table if not exists frames(id integer, name text, videoblock blob, diff blob)'
     cursor.execute(sql)
+    # 清空数据库
     sql = 'delete from frames'
     cursor.execute(sql)
     conn.commit()
 
-    # 把图片文件读取为二进制数据
+    # 把 videoblock 和 差值图 读取为二进制数据
     # 并向 frames 表，插入下面格式的数据
-    # {id: 1, name: 'bbb0.png', image: 图片文件的二进制数据}
-    images = os.listdir(directory)
-    for id, name in enumerate(images):
-        with open(directory + '/' + name, 'rb') as f:
-            image = f.read()
+    # {id: 1, name: 'bbb0.png', videoblock: 二进制数据, diff: 二进制数据}
+    # 这个数据库就表示压缩后的视频
+    videoblocks = sorted(v for v in os.listdir(dir) if v.endswith('videoblock'))
+    diffs = sorted(d for d in os.listdir(dir) if d.endswith('diff.jpg'))
 
-        sql = 'insert into frames (id, name, image) values (?, ?, ?)'
-        cursor.execute(sql, (id, name, image))
+    for id, pair in enumerate(zip(videoblocks, diffs)):
+        vb_path = dir + pair[0]
+        diff_path = dir + pair[1]
+        with open(vb_path, 'rb') as f:
+            vb = f.read()
+        with open(diff_path, 'rb') as f:
+            diff = f.read()
+        name = pair[0].split('.', 1)[0]
+
+        sql = 'insert into frames (id, name, videoblock, diff) values (?, ?, ?, ?)'
+        cursor.execute(sql, (id, name, vb, diff))
 
     conn.commit()
-
-    # 关闭连接
-    conn.close()
-
-
-def encode_img_seq():
-    # 连接数据库文件
-    conn = sqlite3.connect('video.db')
-    cursor = conn.cursor()
-
-    # 从 frames 表拿出所有数据
-    sql = 'select * from frames'
-    rows = cursor.execute(sql)
-    conn.commit()
-
-    for row in rows:
-        # 取出来的每个数据，是一个数组
-
-        # 数组第 0 个对应 id
-        # 数组第 1 个对应 name
-        # 数组第 2 个对应 文件二进制数据
-        id = row[0]
-        name = row[1]
-        image = row[2]
-
-        # 打印出来
-        print('id: {}  name: {}'.format(id, name))
-        # 把文件写出去
-        file_name, file_format = name.split('.', 1)
-        path = file_name + '.' + file_format # TODO: fixme
-        with open(path, 'wb') as f:
-            f.write(image)
 
     # 关闭连接
     conn.close()
@@ -145,7 +127,7 @@ def find_similar_block(image, x, y, block, radius, threshold):
     return blockInfo
 
 
-# 对 img2 进行编码
+# 以 img1 为关键帧, 对 img2 进行编码
 def encode(img1, img2):
 
     # 将 img2 划分为 8x8 大小的图块
@@ -174,45 +156,39 @@ def encode(img1, img2):
         if blockInfo['x'] == -1:
             save_image(diffPixels, x, y, b)
 
-    with open('big_buck_bunny_08361.videoblock', 'w+') as f:
-        f.write(json.dumps(blockInfos, indent=2))
-    diffImg.save('big_buck_bunny_08361.diff.jpg')
+    return blockInfos, diffImg
 
 
-# 图片解码
-def decode(img, diffImg, blockInfos):
-    # 存储解码得到的图片
-    decodeImg = Image.new('L', img.size)
-    decodePixels = decodeImg.load()
+# 对一组图片进行编码
+# 以第一张图为关键帧, 计算并保存后续每一张图片的 videoblock 和 差值图
+# 结果存在 tmpdir 目录下
+def video_encode(dir, tmpdir):
+    images = sorted(os.listdir(dir))
+    keyframe_path = dir + images[0]
+    keyframe = grayimage(keyframe_path)
 
-    # 将 diffImg 切成 8x8 大小的图块
-    diff_blocks = cut_image(diffImg, blocksize)
-    index = 0
-    for c, diff_b in diff_blocks.items():
-        x, y = c
-        # 对于 diffImg 中的每一图块，利用图块的信息找到 img 中对应的图块
-        blockInfo = blockInfos[index]
-        index += 1
+    for i in range(1, len(images)):
+        print('encoding image {}'.format(i))
 
-        if blockInfo['x'] == -1:
-            # 没有对应的图块, 说明 diffImg 中直接存储了原图的数据
-            # 直接把数据拷贝过来即可
-            save_image(decodePixels, x, y, diff_b)
-        else:
-            # 有对应的图块, 则切出对应位置的方块, 并将数据拷贝过来
-            sim_block = get_block(img.load(), blockInfo['x'], blockInfo['y'], blocksize)
-            save_image(decodePixels, x, y, sim_block)
-    
-    decodeImg.save('big_buck_bunny_08361.decode.jpg')
+        path = dir + images[i]
+        img = grayimage(path)
+        blockInfos, diffImg = encode(keyframe, img)
+
+        # 编码结果写入文件
+        prefix = images[i].split('.', 1)[0]
+        name1 = tmpdir + prefix + '.videoblock'
+        name2 = tmpdir + prefix + '.diff.jpg'
+        with open(name1, 'w+') as f:
+            f.write(json.dumps(blockInfos, indent=2))
+        diffImg.save(name2)
 
 
 def main():
-    mode = sys.argv[1]
-    dir = sys.argv[2]
-    video_name = sys.argv[3]
-    
-    db_create(dir)
-    encode_img_seq()
+    dir = 'images/'
+    tmpdir = 'tmp/'
+
+    video_encode(dir, tmpdir)
+    video_db(tmpdir)
 
 
 if __name__ == '__main__':
